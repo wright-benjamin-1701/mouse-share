@@ -72,15 +72,25 @@ class UDPTransport(asyncio.DatagramProtocol):
     def queue_event(self, event: InputEvent) -> None:
         """Queue an event for batched sending.
 
-        MouseMove events are coalesced: their deltas are accumulated
-        and emitted as a single event at flush time.
+        Consecutive MouseMove events are coalesced: their deltas are
+        accumulated into one move. Any other event first closes the pending
+        move, so order is kept: a press then a drag must not arrive as a
+        drag then a press.
         """
         if isinstance(event, MouseMove):
             self._coalesce_dx += event.dx
             self._coalesce_dy += event.dy
             self._has_coalesced_move = True
         else:
+            self._close_coalesced_move()
             self._send_queue.append(event)
+
+    def _close_coalesced_move(self) -> None:
+        if self._has_coalesced_move:
+            self._send_queue.append(MouseMove(dx=self._coalesce_dx, dy=self._coalesce_dy))
+            self._coalesce_dx = 0
+            self._coalesce_dy = 0
+            self._has_coalesced_move = False
 
     def start_flush_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start the periodic flush task."""
@@ -95,18 +105,16 @@ class UDPTransport(asyncio.DatagramProtocol):
         except asyncio.CancelledError:
             self._flush()  # Final flush on shutdown
 
+    def flush_now(self) -> None:
+        """Send queued events immediately, e.g. before the target changes."""
+        self._flush()
+
     def _flush(self) -> None:
         """Encode and send all queued events."""
         if self._transport is None or self._target is None:
             return
 
-        # Prepend coalesced mouse move if present
-        if self._has_coalesced_move:
-            move = MouseMove(dx=self._coalesce_dx, dy=self._coalesce_dy)
-            self._send_queue.insert(0, move)
-            self._coalesce_dx = 0
-            self._coalesce_dy = 0
-            self._has_coalesced_move = False
+        self._close_coalesced_move()
 
         if not self._send_queue:
             return

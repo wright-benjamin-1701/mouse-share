@@ -19,7 +19,8 @@ from mouse_share.net.protocol import (
     encode_control_message,
     read_length_prefixed,
 )
-from mouse_share.net.sockopt import SocketOptions, apply_tcp_opts
+from mouse_share.net.sockopt import NICInfo, SocketOptions, apply_tcp_opts, list_nics
+from mouse_share.screen import MonitorInfo
 
 
 class ControlConnection:
@@ -53,6 +54,11 @@ class ControlConnection:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def peername(self) -> Any:
+        """Remote socket address, as reported by the transport."""
+        return self._writer.get_extra_info("peername")
+
     def on(self, msg_type: ControlMessageType, handler: Any) -> None:
         """Register a handler for a message type. Handler signature: async (payload) -> None."""
         self._handlers.setdefault(msg_type, []).append(handler)
@@ -65,14 +71,63 @@ class ControlConnection:
         self._writer.write(data)
         await self._writer.drain()
 
-    async def send_hello(self, screen_width: int, screen_height: int) -> None:
-        """Send a hello handshake message."""
+    async def send_hello(self, monitors: list[MonitorInfo]) -> None:
+        """Send a hello handshake message including local NIC addresses and monitors."""
+        nics = list_nics()
+
+        monitors_payload = [
+            {
+                "name": m.name,
+                "x": m.x,
+                "y": m.y,
+                "width": m.width,
+                "height": m.height,
+                "primary": m.is_primary,
+            }
+            for m in monitors
+        ]
+
+        # Compute bounding box for backward-compat "screen" key
+        if monitors:
+            max_right = max(m.x + m.width for m in monitors)
+            max_bottom = max(m.y + m.height for m in monitors)
+            min_x = min(m.x for m in monitors)
+            min_y = min(m.y for m in monitors)
+            bbox_w = max_right - min_x
+            bbox_h = max_bottom - min_y
+        else:
+            bbox_w, bbox_h = 1920, 1080
+
         await self.send(ControlMessageType.HELLO, {
             "version": PROTOCOL_VERSION,
             "hostname": platform.node(),
             "platform": platform.system().lower(),
-            "screen": {"width": screen_width, "height": screen_height},
+            "screen": {"width": bbox_w, "height": bbox_h},
+            "monitors": monitors_payload,
+            "nics": [{"name": n.name, "ipv4": n.ipv4} for n in nics],
         })
+
+    @property
+    def peer_nics(self) -> list[NICInfo]:
+        """Extract the peer's NIC list from the hello handshake."""
+        raw = self._peer_info.get("nics", [])
+        return [NICInfo(name=n["name"], ipv4=n["ipv4"]) for n in raw if "name" in n and "ipv4" in n]
+
+    @property
+    def peer_monitors(self) -> list[MonitorInfo]:
+        """Extract the peer's monitor list from the hello handshake."""
+        raw = self._peer_info.get("monitors", [])
+        return [
+            MonitorInfo(
+                name=m.get("name", "unknown"),
+                x=m.get("x", 0),
+                y=m.get("y", 0),
+                width=m.get("width", 1920),
+                height=m.get("height", 1080),
+                is_primary=m.get("primary", False),
+            )
+            for m in raw
+        ]
 
     async def send_ping(self) -> None:
         """Send a ping for latency measurement."""
@@ -85,6 +140,16 @@ class ControlConnection:
             "target": target_peer,
             "entry_x": entry_x,
             "entry_y": entry_y,
+        })
+
+    async def send_screen_config(self, offset_x: int, offset_y: int) -> None:
+        """Tell the peer where its monitors sit in our layout space.
+
+        The peer mirrors this, placing our monitors at the negated offset.
+        """
+        await self.send(ControlMessageType.SCREEN_CONFIG, {
+            "offset_x": offset_x,
+            "offset_y": offset_y,
         })
 
     async def send_clipboard(self, content: str, content_type: str = "text/plain") -> None:
